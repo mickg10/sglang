@@ -4,6 +4,7 @@ from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
     KimiDetector,
+    KimiK2ReasoningDetector,
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
@@ -311,6 +312,164 @@ class TestKimiDetector(CustomTestCase):
         result = self.detector.parse_streaming_increment("◁/think▷answer")
         self.assertEqual(result.reasoning_text, "")  # Buffer cleared
         self.assertEqual(result.normal_text, "answer")
+
+
+class TestKimiK2ReasoningDetector(CustomTestCase):
+    def setUp(self):
+        self.detector = KimiK2ReasoningDetector()
+
+    def test_init(self):
+        """Test KimiK2ReasoningDetector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertTrue(self.detector.stream_reasoning)
+
+    def test_detect_and_parse_normal_text(self):
+        """Test parsing normal text without reasoning."""
+        text = "Direct answer without thinking tokens."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_detect_and_parse_with_think_end(self):
+        """Test parsing reasoning that ends with </think> (same as Qwen3)."""
+        text = "<think>Let me think about this</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think about this")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_tool_call_ends_reasoning(self):
+        """Test that <|tool_calls_section_begin|> ends reasoning without </think>."""
+        text = (
+            "<think>I need to call a function"
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:0"
+            '<|tool_call_argument_begin|>{"city":"NYC"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I need to call a function")
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+        self.assertIn("<|tool_call_begin|>", result.normal_text)
+
+    def test_detect_and_parse_think_end_before_tool_call(self):
+        """Test </think> followed by tool call — </think> takes priority."""
+        text = (
+            "<think>reasoning</think>"
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.foo:0"
+            '<|tool_call_argument_begin|>{"a":1}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "reasoning")
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+
+    def test_detect_and_parse_force_reasoning_tool_call(self):
+        """Test force_reasoning=True with tool call ending reasoning."""
+        detector = KimiK2ReasoningDetector(force_reasoning=True)
+        text = (
+            "I should look this up"
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.search:0"
+            '<|tool_call_argument_begin|>{"q":"test"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I should look this up")
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+
+    def test_streaming_tool_call_during_reasoning(self):
+        """Test streaming: tool call marker arrives while in reasoning mode."""
+        # Enter reasoning
+        self.detector.parse_streaming_increment("<think>")
+        self.assertTrue(self.detector._in_reasoning)
+
+        # Reasoning content
+        result = self.detector.parse_streaming_increment("I need to call a tool")
+        self.assertEqual(result.reasoning_text, "I need to call a tool")
+        self.assertEqual(result.normal_text, "")
+
+        # Tool call marker ends reasoning
+        result = self.detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|><|tool_call_begin|>"
+        )
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+        self.assertIn("<|tool_call_begin|>", result.normal_text)
+
+    def test_streaming_think_end_then_tool_call(self):
+        """Test streaming: </think> followed by tool call in separate chunks."""
+        self.detector.parse_streaming_increment("<think>")
+
+        result = self.detector.parse_streaming_increment("reasoning")
+        self.assertEqual(result.reasoning_text, "reasoning")
+
+        result = self.detector.parse_streaming_increment("</think>")
+        self.assertFalse(self.detector._in_reasoning)
+
+        result = self.detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|><|tool_call_begin|>"
+        )
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+
+    def test_streaming_think_end_and_tool_call_same_chunk(self):
+        """Test streaming: </think> and tool call marker in the same delta."""
+        self.detector.parse_streaming_increment("<think>")
+        self.detector.parse_streaming_increment("thinking")
+
+        result = self.detector.parse_streaming_increment(
+            "</think><|tool_calls_section_begin|><|tool_call_begin|>"
+        )
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+
+    def test_streaming_force_reasoning_tool_call(self):
+        """Test streaming with force_reasoning=True and tool call ending reasoning."""
+        detector = KimiK2ReasoningDetector(force_reasoning=True)
+
+        result = detector.parse_streaming_increment("Let me search")
+        self.assertEqual(result.reasoning_text, "Let me search")
+        self.assertTrue(detector._in_reasoning)
+
+        result = detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|><|tool_call_begin|>"
+        )
+        self.assertFalse(detector._in_reasoning)
+        self.assertIn("<|tool_calls_section_begin|>", result.normal_text)
+
+    def test_streaming_partial_tool_marker_buffering(self):
+        """Test that a partial tool call marker prefix is buffered, not emitted as reasoning."""
+        detector = KimiK2ReasoningDetector(force_reasoning=True)
+
+        result = detector.parse_streaming_increment("thinking")
+        self.assertEqual(result.reasoning_text, "thinking")
+
+        # Partial marker — should be buffered
+        result = detector.parse_streaming_increment("<|tool_calls")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+
+        # Complete the marker
+        result = detector.parse_streaming_increment("_section_begin|>rest")
+        self.assertFalse(detector._in_reasoning)
+        self.assertIn("rest", result.normal_text)
+
+    def test_detect_and_parse_truncated_reasoning(self):
+        """Test truncated reasoning (no end marker at all)."""
+        text = "<think>This reasoning was truncated"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "This reasoning was truncated")
+        self.assertEqual(result.normal_text, "")
+
+    def test_reasoning_parser_uses_kimi_k2_detector(self):
+        """Test that ReasoningParser maps kimi_k2 to KimiK2ReasoningDetector."""
+        parser = ReasoningParser("kimi_k2")
+        self.assertIsInstance(parser.detector, KimiK2ReasoningDetector)
 
 
 class TestReasoningParser(CustomTestCase):

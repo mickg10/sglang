@@ -238,6 +238,152 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class KimiK2ReasoningDetector(BaseReasoningFormatDetector):
+    """
+    Detector for Kimi K2 model.
+    Uses <think>/</think> reasoning tokens (same as Qwen3), but also treats
+    <|tool_calls_section_begin|> as an implicit end-of-reasoning marker.
+
+    When the model goes from reasoning directly to a tool call without emitting
+    </think> first, this detector ends reasoning at the tool call marker and
+    passes the marker through as normal_text so the tool call parser can see it.
+    """
+
+    TOOL_CALL_SECTION_BEGIN = "<|tool_calls_section_begin|>"
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+    def _find_reasoning_end(self, text: str) -> Tuple[int, int]:
+        """Find the earliest reasoning-end marker in text.
+
+        Returns (index, skip_length) where:
+        - index is the position of the marker (-1 if not found)
+        - skip_length is how many chars to skip over (the marker itself):
+          - For </think>: skip the full tag (tool parser doesn't need it)
+          - For <|tool_calls_section_begin|>: skip 0 (tool parser needs it)
+        """
+        think_idx = text.find(self.think_end_token)
+        tool_idx = text.find(self.TOOL_CALL_SECTION_BEGIN)
+
+        if think_idx == -1 and tool_idx == -1:
+            return (-1, 0)
+        if think_idx == -1:
+            return (tool_idx, 0)
+        if tool_idx == -1:
+            return (think_idx, len(self.think_end_token))
+        # Both found — use whichever comes first
+        if think_idx <= tool_idx:
+            return (think_idx, len(self.think_end_token))
+        return (tool_idx, 0)
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        in_reasoning = self._in_reasoning or self.think_start_token in text
+
+        if not in_reasoning:
+            return StreamingParseResult(normal_text=text)
+
+        processed_text = text.replace(self.think_start_token, "").strip()
+
+        end_idx, skip_len = self._find_reasoning_end(processed_text)
+
+        if end_idx == -1:
+            # Check if end token is in previous content (continue_final_message)
+            if self.think_end_token in self.previous_content:
+                return StreamingParseResult(normal_text=processed_text)
+            return StreamingParseResult(reasoning_text=processed_text)
+
+        reasoning_text = processed_text[:end_idx]
+        normal_text = processed_text[end_idx + skip_len:].strip()
+
+        return StreamingParseResult(
+            normal_text=normal_text, reasoning_text=reasoning_text
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        self._buffer += new_text
+        current_text = self._buffer
+
+        # If the current text is a prefix of a token, keep buffering
+        all_tokens = [
+            self.think_start_token,
+            self.think_end_token,
+            self.TOOL_CALL_SECTION_BEGIN,
+        ]
+        if any(
+            token.startswith(current_text) and token != current_text
+            for token in all_tokens
+        ):
+            return StreamingParseResult()
+
+        # Strip <think> token if present
+        if not self.stripped_think_start and self.think_start_token in current_text:
+            current_text = current_text.replace(self.think_start_token, "")
+            self.stripped_think_start = True
+            self._in_reasoning = True
+
+        # Handle end of reasoning block (</think> or tool call marker)
+        if self._in_reasoning:
+            end_idx, skip_len = self._find_reasoning_end(current_text)
+            if end_idx != -1:
+                reasoning_text = current_text[:end_idx]
+                self._buffer = ""
+                self._in_reasoning = False
+                normal_text = current_text[end_idx + skip_len:]
+                return StreamingParseResult(
+                    normal_text=normal_text,
+                    reasoning_text=reasoning_text.rstrip(),
+                )
+
+        # Continue with reasoning content
+        if self._in_reasoning:
+            if self.stream_reasoning:
+                # Check if buffer might be a prefix of the tool call marker
+                # to avoid emitting partial markers as reasoning
+                if any(
+                    self.TOOL_CALL_SECTION_BEGIN.startswith(current_text[-i:])
+                    and self.TOOL_CALL_SECTION_BEGIN != current_text[-i:]
+                    for i in range(1, len(current_text) + 1)
+                ):
+                    # Buffer ends with a potential prefix of the tool marker
+                    # Find the prefix boundary and only emit what's safe
+                    for i in range(len(current_text), 0, -1):
+                        suffix = current_text[-i:]
+                        if (
+                            self.TOOL_CALL_SECTION_BEGIN.startswith(suffix)
+                            and self.TOOL_CALL_SECTION_BEGIN != suffix
+                        ):
+                            safe = current_text[:-i]
+                            self._buffer = suffix
+                            if safe:
+                                return StreamingParseResult(reasoning_text=safe)
+                            return StreamingParseResult()
+                self._buffer = ""
+                return StreamingParseResult(reasoning_text=current_text)
+            else:
+                return StreamingParseResult()
+
+        # Not in reasoning — return as normal text
+        if not self._in_reasoning:
+            self._buffer = ""
+            return StreamingParseResult(normal_text=current_text)
+
+        return StreamingParseResult()
+
+
 class GptOssDetector(BaseReasoningFormatDetector):
     """
     Detector for T4-style reasoning format (GPT-OSS), using the HarmonyParser.
@@ -378,7 +524,7 @@ class ReasoningParser:
         "glm45": Qwen3Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
-        "kimi_k2": Qwen3Detector,
+        "kimi_k2": KimiK2ReasoningDetector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
