@@ -266,6 +266,10 @@ class KimiK2ReasoningDetector(BaseReasoningFormatDetector):
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
+        # The base class only checks think_start/end tokens in previous_content.
+        # We also need to check the tool call marker as an implicit end-of-reasoning.
+        if self.TOOL_CALL_SECTION_BEGIN in self.previous_content:
+            self._in_reasoning = False
 
     def _find_reasoning_end(self, text: str) -> Tuple[int, int]:
         """Find the earliest reasoning-end marker in text.
@@ -301,8 +305,11 @@ class KimiK2ReasoningDetector(BaseReasoningFormatDetector):
         end_idx, skip_len = self._find_reasoning_end(processed_text)
 
         if end_idx == -1:
-            # Check if end token is in previous content (continue_final_message)
-            if self.think_end_token in self.previous_content:
+            # Check if reasoning already ended in previous content
+            if (
+                self.think_end_token in self.previous_content
+                or self.TOOL_CALL_SECTION_BEGIN in self.previous_content
+            ):
                 return StreamingParseResult(normal_text=processed_text)
             return StreamingParseResult(reasoning_text=processed_text)
 

@@ -466,6 +466,28 @@ class TestKimiK2ReasoningDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "This reasoning was truncated")
         self.assertEqual(result.normal_text, "")
 
+    def test_continue_final_message_with_tool_call_in_previous(self):
+        """Test continue_final_message when previous content has tool call marker."""
+        previous = (
+            "<think>reasoning"
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.foo:0"
+            '<|tool_call_argument_begin|>{"a":1}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        detector = KimiK2ReasoningDetector(
+            continue_final_message=True,
+            previous_content=previous,
+        )
+        # Reasoning already ended via tool call in previous content
+        self.assertFalse(detector._in_reasoning)
+
+        # New text should be treated as normal, not reasoning
+        result = detector.detect_and_parse("continuation text")
+        self.assertEqual(result.normal_text, "continuation text")
+        self.assertEqual(result.reasoning_text, "")
+
     def test_reasoning_parser_uses_kimi_k2_detector(self):
         """Test that ReasoningParser maps kimi_k2 to KimiK2ReasoningDetector."""
         parser = ReasoningParser("kimi_k2")
